@@ -1,0 +1,14 @@
+"""evaluation/ – Metrics, benchmarks, and visualization."""
+from .visualizer import (
+    plot_trajectory_3d, plot_sensor_fusion_analysis,
+    plot_reward_curve, plot_heatmap_2d,
+    plot_benchmark_comparison, build_interactive_report,
+    generate_full_report, load_flight_npz, load_flight_csv,
+)
+
+__all__ = [
+    "plot_trajectory_3d", "plot_sensor_fusion_analysis",
+    "plot_reward_curve", "plot_heatmap_2d",
+    "plot_benchmark_comparison", "build_interactive_report",
+    "generate_full_report", "load_flight_npz", "load_flight_csv",
+]

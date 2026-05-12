@@ -1,0 +1,44 @@
+"""
+=============================================================================
+utils/__init__.py  –  Autonomous UAV Navigation System
+=============================================================================
+Shared utilities: configuration loader, structured logger, math helpers,
+coordinate transforms, and performance timers.
+=============================================================================
+"""
+
+from .config_loader import ConfigLoader, UAVConfig
+from .logger import UAVLogger, get_logger
+from .math_utils import (
+    euler_to_rotation_matrix,
+    rotation_matrix_to_euler,
+    quaternion_to_euler,
+    euler_to_quaternion,
+    wrap_angle,
+    haversine_distance,
+    ned_to_enu,
+    enu_to_ned,
+    clamp,
+    normalize_vector,
+)
+from .timer import PerformanceTimer
+from .data_recorder import FlightDataRecorder
+
+__all__ = [
+    "ConfigLoader",
+    "UAVConfig",
+    "UAVLogger",
+    "get_logger",
+    "euler_to_rotation_matrix",
+    "rotation_matrix_to_euler",
+    "quaternion_to_euler",
+    "euler_to_quaternion",
+    "wrap_angle",
+    "haversine_distance",
+    "ned_to_enu",
+    "enu_to_ned",
+    "clamp",
+    "normalize_vector",
+    "PerformanceTimer",
+    "FlightDataRecorder",
+]

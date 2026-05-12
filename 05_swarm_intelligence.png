@@ -1,0 +1,422 @@
+"""
+=============================================================================
+evaluation/visualizer.py  –  Advanced Flight Visualization Suite
+=============================================================================
+Post-flight analysis and visualization:
+  - 3D trajectory plots (Plotly & Matplotlib)
+  - Flight heatmaps
+  - Sensor fusion error analysis
+  - Reward curves
+  - Obstacle encounter maps
+  - Energy consumption profiles
+  - Comparative algorithm benchmarks
+=============================================================================
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")   # Non-interactive backend
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from mpl_toolkits.mplot3d import Axes3D
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
+    _HAS_MPL = True
+except ImportError:
+    _HAS_MPL = False
+
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+    _HAS_PLOTLY = True
+except ImportError:
+    _HAS_PLOTLY = False
+
+
+DARK_STYLE = {
+    "figure.facecolor":  "#0a0e1a",
+    "axes.facecolor":    "#0f1626",
+    "axes.edgecolor":    "#1a2640",
+    "axes.labelcolor":   "#c8d8e8",
+    "text.color":        "#c8d8e8",
+    "xtick.color":       "#c8d8e8",
+    "ytick.color":       "#c8d8e8",
+    "grid.color":        "#1a2640",
+    "grid.alpha":        1.0,
+    "font.family":       "monospace",
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data Loader
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_flight_npz(path: str) -> Dict[str, np.ndarray]:
+    """Load flight arrays from NPZ file."""
+    data = np.load(path)
+    return dict(data)
+
+
+def load_flight_csv(path: str) -> Dict[str, np.ndarray]:
+    """Load flight data from CSV via numpy."""
+    try:
+        import pandas as pd
+        df = pd.read_csv(path)
+        return {col: df[col].values for col in df.columns}
+    except ImportError:
+        data = np.genfromtxt(path, delimiter=",", names=True, dtype=None, encoding="utf-8")
+        return {name: data[name] for name in data.dtype.names}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Matplotlib Plots
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_trajectory_3d(flight_data: Dict, save_path: Optional[str] = None,
+                        obstacles: List = None) -> Optional[str]:
+    """High-quality 3D trajectory plot."""
+    if not _HAS_MPL:
+        return None
+
+    with plt.rc_context(DARK_STYLE):
+        fig = plt.figure(figsize=(14, 10))
+        ax  = fig.add_subplot(111, projection="3d")
+
+        xs = flight_data.get("pos_x", np.array([0]))
+        ys = flight_data.get("pos_y", np.array([0]))
+        zs = flight_data.get("pos_z", np.array([0]))
+
+        # Speed coloring
+        vx = flight_data.get("vel_x", np.zeros_like(xs))
+        vy = flight_data.get("vel_y", np.zeros_like(xs))
+        vz = flight_data.get("vel_z", np.zeros_like(xs))
+        speeds = np.sqrt(vx**2 + vy**2 + vz**2)
+
+        # Colored line segments
+        points  = np.array([xs, ys, zs]).T.reshape(-1, 1, 3)
+        segments= np.concatenate([points[:-1], points[1:]], axis=1)
+        norm    = Normalize(vmin=0, vmax=max(speeds.max(), 1))
+        lc      = Line3DCollection(segments, cmap="plasma", norm=norm, linewidth=2, alpha=0.9)
+        lc.set_array(speeds[:-1])
+        ax.add_collection3d(lc)
+
+        # Colorbar
+        sm = ScalarMappable(cmap="plasma", norm=norm)
+        sm.set_array([])
+        cb = fig.colorbar(sm, ax=ax, pad=0.05, shrink=0.5)
+        cb.set_label("Speed (m/s)", color="#c8d8e8")
+
+        # Start / End markers
+        ax.scatter(*[xs[0]], *[ys[0]], *[zs[0]], c="#00ff88", s=150, zorder=5,
+                   marker="o", label="Start", depthshade=False)
+        ax.scatter(*[xs[-1]], *[ys[-1]], *[zs[-1]], c="#ffd700", s=200, zorder=5,
+                   marker="*", label="End", depthshade=False)
+
+        # Ground shadow
+        ax.plot(xs, ys, np.zeros_like(zs), "--", color="#ffffff22", linewidth=1, zorder=1)
+
+        # Obstacles
+        if obstacles:
+            for obs in obstacles[:40]:
+                ox, oy, oz = obs["position"]
+                r = obs.get("radius", 2.0)
+                clr = "#ff335588" if obs.get("type") == "dynamic" else "#55555588"
+                ax.scatter(ox, oy, oz, c=clr, s=max(20, r*30), marker="s",
+                           alpha=0.7, depthshade=True)
+
+        ax.set_xlabel("East (m)",     labelpad=10)
+        ax.set_ylabel("North (m)",    labelpad=10)
+        ax.set_zlabel("Altitude (m)", labelpad=10)
+        ax.set_title("3D Flight Trajectory", fontsize=14, color="#00d4ff", pad=15)
+        ax.legend(facecolor="#0f1626", edgecolor="#1a2640", labelcolor="#c8d8e8")
+        ax.grid(True, alpha=0.3)
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+            plt.close()
+            return save_path
+        plt.show()
+    return None
+
+
+def plot_sensor_fusion_analysis(flight_data: Dict, save_path: Optional[str] = None) -> Optional[str]:
+    """EKF convergence and sensor quality analysis."""
+    if not _HAS_MPL:
+        return None
+
+    with plt.rc_context(DARK_STYLE):
+        fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+        fig.suptitle("Sensor Fusion Analysis", fontsize=14, color="#00d4ff")
+
+        t = flight_data.get("t", np.arange(len(flight_data.get("pos_x", [0]))) * 0.02)
+
+        plot_configs = [
+            ("pos_x",       "Position X (m)",     "#00d4ff"),
+            ("pos_y",       "Position Y (m)",     "#00ff88"),
+            ("pos_z",       "Altitude (m)",        "#ffd700"),
+            ("vel_x",       "Velocity X (m/s)",   "#ff6b35"),
+            ("vel_y",       "Velocity Y (m/s)",   "#cc44ff"),
+            ("battery_pct", "Battery (%)",         "#ff3355"),
+        ]
+
+        for ax, (key, label, clr) in zip(axes.flat, plot_configs):
+            vals = flight_data.get(key, np.zeros_like(t))
+            ax.plot(t[:len(vals)], vals, color=clr, linewidth=1.5, alpha=0.9)
+            ax.set_ylabel(label, fontsize=9)
+            ax.set_xlabel("Time (s)", fontsize=9)
+            ax.grid(True, alpha=0.3)
+            ax.set_title(label, fontsize=9, color=clr)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=120, bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
+            plt.close()
+            return save_path
+        plt.show()
+    return None
+
+
+def plot_reward_curve(reward_log: List[float], window: int = 100,
+                       save_path: Optional[str] = None) -> Optional[str]:
+    """Training reward curve with moving average."""
+    if not _HAS_MPL:
+        return None
+
+    with plt.rc_context(DARK_STYLE):
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        eps     = np.arange(len(reward_log))
+        rewards = np.array(reward_log)
+
+        # Raw rewards
+        ax.plot(eps, rewards, color="#00d4ff33", linewidth=0.8, label="Episode reward")
+
+        # Moving average
+        if len(rewards) >= window:
+            kernel = np.ones(window) / window
+            ma     = np.convolve(rewards, kernel, mode="valid")
+            ax.plot(eps[window-1:], ma, color="#00d4ff", linewidth=2.5,
+                    label=f"{window}-ep moving avg")
+
+        # Fill under MA
+        if len(rewards) >= window:
+            ax.fill_between(eps[window-1:], ma, alpha=0.1, color="#00d4ff")
+
+        ax.set_xlabel("Episode", fontsize=11)
+        ax.set_ylabel("Total Reward", fontsize=11)
+        ax.set_title("Training Reward Curve", fontsize=14, color="#00d4ff")
+        ax.legend(facecolor="#0f1626", edgecolor="#1a2640")
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=120, bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
+            plt.close()
+            return save_path
+        plt.show()
+    return None
+
+
+def plot_heatmap_2d(flight_data: Dict, grid_size: Tuple = (200, 200),
+                     save_path: Optional[str] = None) -> Optional[str]:
+    """2D occupancy heatmap showing where UAV spent time."""
+    if not _HAS_MPL:
+        return None
+
+    xs = flight_data.get("pos_x", np.array([0]))
+    ys = flight_data.get("pos_y", np.array([0]))
+
+    with plt.rc_context(DARK_STYLE):
+        fig, ax = plt.subplots(figsize=(10, 10))
+
+        h, xedges, yedges = np.histogram2d(xs, ys, bins=50,
+                                            range=[[0, grid_size[0]],
+                                                   [0, grid_size[1]]])
+        h_smooth = h.T
+        im = ax.imshow(
+            h_smooth,
+            origin="lower",
+            extent=[0, grid_size[0], 0, grid_size[1]],
+            cmap="hot",
+            interpolation="gaussian",
+            aspect="equal",
+            alpha=0.85,
+        )
+        cb = fig.colorbar(im, ax=ax, shrink=0.8)
+        cb.set_label("Time Spent (steps)", color="#c8d8e8")
+
+        # Start & end
+        ax.scatter(xs[0], ys[0], c="#00ff88", s=200, zorder=5, marker="o", label="Start")
+        ax.scatter(xs[-1], ys[-1], c="#ffd700", s=250, zorder=5, marker="*", label="End")
+        ax.legend(facecolor="#0f1626", edgecolor="#1a2640")
+
+        ax.set_xlabel("East (m)"); ax.set_ylabel("North (m)")
+        ax.set_title("2D Flight Heatmap", fontsize=14, color="#00d4ff")
+        ax.grid(True, alpha=0.2)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=120, bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
+            plt.close()
+            return save_path
+        plt.show()
+    return None
+
+
+def plot_benchmark_comparison(results: Dict[str, Dict],
+                               save_path: Optional[str] = None) -> Optional[str]:
+    """Bar chart comparing algorithms/scenarios."""
+    if not _HAS_MPL:
+        return None
+
+    scenarios = list(results.keys())
+    metrics   = ["success_rate", "collision_rate", "mean_reward"]
+    labels    = ["Success Rate", "Collision Rate", "Mean Reward (norm)"]
+    colors    = ["#00ff88", "#ff3355", "#00d4ff"]
+
+    with plt.rc_context(DARK_STYLE):
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        fig.suptitle("Algorithm Benchmark Comparison", fontsize=14, color="#00d4ff")
+
+        for ax, metric, label, clr in zip(axes, metrics, labels, colors):
+            vals = []
+            for sc in scenarios:
+                v = results[sc].get(metric, 0.0)
+                if metric == "mean_reward":
+                    v = (v + 200) / 400   # Normalize to 0..1
+                vals.append(v)
+
+            bars = ax.bar(scenarios, vals, color=clr, alpha=0.8, edgecolor=clr,
+                          linewidth=1.5, width=0.5)
+            for bar, v in zip(bars, vals):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                        f"{v:.2f}", ha="center", va="bottom", fontsize=9, color=clr)
+
+            ax.set_title(label, fontsize=11, color=clr)
+            ax.set_ylim(0, 1.15)
+            ax.grid(True, alpha=0.3, axis="y")
+            ax.tick_params(axis="x", rotation=20)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=120, bbox_inches="tight",
+                        facecolor=fig.get_facecolor())
+            plt.close()
+            return save_path
+        plt.show()
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Plotly Interactive Report
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_interactive_report(flight_data: Dict, output_html: str = "evaluation/report.html") -> str:
+    """Generate a standalone interactive HTML report with Plotly."""
+    if not _HAS_PLOTLY:
+        return ""
+
+    t   = flight_data.get("t", np.arange(100) * 0.02)
+    xs  = flight_data.get("pos_x", np.zeros(len(t)))
+    ys  = flight_data.get("pos_y", np.zeros(len(t)))
+    zs  = flight_data.get("pos_z", np.zeros(len(t)))
+    vx  = flight_data.get("vel_x", np.zeros(len(t)))
+    vy  = flight_data.get("vel_y", np.zeros(len(t)))
+    vz  = flight_data.get("vel_z", np.zeros(len(t)))
+    bat = flight_data.get("battery_pct", np.full(len(t), 100.0))
+    rew = flight_data.get("reward", np.zeros(len(t)))
+
+    speeds = np.sqrt(vx**2 + vy**2 + vz**2)
+
+    fig = make_subplots(
+        rows=3, cols=2,
+        specs=[
+            [{"type": "scatter3d", "rowspan": 2}, {"type": "xy"}],
+            [None,                                 {"type": "xy"}],
+            [{"type": "xy"},                       {"type": "xy"}],
+        ],
+        subplot_titles=("3D Trajectory", "Altitude & Speed", " ",
+                        "Battery", "Cumulative Reward"),
+        vertical_spacing=0.08,
+    )
+
+    # 3D trajectory
+    fig.add_trace(go.Scatter3d(
+        x=xs, y=ys, z=zs,
+        mode="lines",
+        line=dict(color=speeds, colorscale="Plasma", width=4),
+        name="Trajectory",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter3d(
+        x=[xs[-1]], y=[ys[-1]], z=[zs[-1]],
+        mode="markers",
+        marker=dict(size=10, color="#ffd700"),
+        name="End",
+    ), row=1, col=1)
+
+    # Altitude & Speed
+    fig.add_trace(go.Scatter(x=t[:len(zs)], y=zs, name="Altitude",
+                              line=dict(color="#00d4ff", width=2)), row=1, col=2)
+    fig.add_trace(go.Scatter(x=t[:len(speeds)], y=speeds, name="Speed",
+                              line=dict(color="#ff6b35", width=2),
+                              yaxis="y2"), row=1, col=2)
+
+    # Battery
+    fig.add_trace(go.Scatter(x=t[:len(bat)], y=bat, name="Battery %",
+                              fill="tozeroy", line=dict(color="#ffd700", width=2)), row=3, col=1)
+
+    # Cumulative reward
+    cum_rew = np.cumsum(rew[:len(t)])
+    fig.add_trace(go.Scatter(x=t[:len(cum_rew)], y=cum_rew, name="Cumulative Reward",
+                              line=dict(color="#00ff88", width=2)), row=3, col=2)
+
+    fig.update_layout(
+        template="plotly_dark",
+        title=dict(text="UAV Flight Analysis Report", font=dict(size=18, color="#00d4ff")),
+        height=900,
+        showlegend=True,
+        font=dict(family="monospace"),
+        paper_bgcolor="#0a0e1a",
+        plot_bgcolor="#0f1626",
+    )
+
+    Path(output_html).parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(output_html, include_plotlyjs="cdn")
+    return output_html
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Full Report Generator
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_full_report(flight_npz: str, output_dir: str = "evaluation") -> Dict[str, str]:
+    """Generate all plots and interactive report from flight data."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    data = load_flight_npz(flight_npz)
+    paths = {}
+
+    paths["trajectory_3d"]  = plot_trajectory_3d(data,    str(out / "trajectory_3d.png"))
+    paths["sensor_analysis"] = plot_sensor_fusion_analysis(data, str(out / "sensor_analysis.png"))
+    paths["heatmap"]         = plot_heatmap_2d(data,       str(out / "heatmap.png"))
+    paths["interactive"]     = build_interactive_report(data, str(out / "report.html"))
+
+    return {k: v for k, v in paths.items() if v}

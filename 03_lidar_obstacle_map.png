@@ -1,0 +1,727 @@
+"""
+=============================================================================
+envs/uav_env.py  –  Gymnasium UAV Simulation Environment
+=============================================================================
+Full physics-based UAV simulation environment compatible with:
+  - OpenAI Gymnasium API
+  - Stable-Baselines3 training
+  - Custom RL algorithms
+
+Simulation includes:
+  - 6-DOF rigid body dynamics with rotor aerodynamics
+  - Wind disturbances (turbulence + gusts)
+  - GPS degradation zones
+  - Dynamic obstacles
+  - Battery consumption model
+  - Multiple environment types (urban/forest/mountain/open)
+=============================================================================
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+try:
+    import gymnasium as gym
+    from gymnasium import spaces
+except ImportError:
+    import gym
+    from gym import spaces
+
+from sensors.models import SensorSuite
+from sensors.fusion import SensorFusionManager, IMUMeasurement
+from navigation.path_planning import MissionPlanner, Waypoint
+from navigation.controller import CascadedController, WaypointSequencer
+from utils.math_utils import (
+    euler_to_rotation_matrix, body_to_world,
+    clamp, wrap_angle, normalize_vector
+)
+from utils.logger import get_logger
+from utils.data_recorder import FlightDataRecorder
+
+log = get_logger("ENV")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UAV Dynamics Model
+# ──────────────────────────────────────────────────────────────────────────────
+
+class UAVDynamics:
+    """
+    6-DOF multirotor dynamics using Newton-Euler equations.
+
+    State: [pos(3), vel(3), att(3), omega(3)] in ENU world frame
+    Input: motor_commands[4] ∈ [0, 1]
+
+    Models:
+      - Rotor thrust & reaction torque
+      - Aerodynamic drag
+      - Wind effects
+      - Ground effect (near terrain)
+    """
+
+    G = 9.81
+
+    def __init__(self, config: dict):
+        uav = config.get("uav", {})
+        self.mass     = uav.get("mass_kg", 1.5)
+        self.arm      = uav.get("arm_length_m", 0.23)
+        self.max_thr  = uav.get("max_thrust_N", 25.0)
+        self.max_vel  = uav.get("max_velocity_ms", 15.0)
+        self.drag_c   = uav.get("drag_coefficient", 0.1)
+        iner          = uav.get("inertia", {})
+        self.Ixx      = iner.get("Ixx", 0.0123)
+        self.Iyy      = iner.get("Iyy", 0.0123)
+        self.Izz      = iner.get("Izz", 0.0246)
+        self.I        = np.diag([self.Ixx, self.Iyy, self.Izz])
+        self.I_inv    = np.linalg.inv(self.I)
+
+        # Thrust / torque constants
+        self.k_T  = self.max_thr / (4.0 * 1.0**2)   # Thrust constant per motor unit²
+        self.k_M  = 0.016 * self.k_T                  # Reaction torque constant
+
+        # State
+        self.pos   = np.zeros(3)
+        self.vel   = np.zeros(3)
+        self.att   = np.zeros(3)   # roll, pitch, yaw [rad]
+        self.omega = np.zeros(3)   # angular rates in body frame [rad/s]
+
+        # Battery model
+        self.battery_capacity_mAh = uav.get("battery_capacity_mAh", 5000.0)
+        self.hover_current_A      = uav.get("hover_current_A", 8.5)
+        self.battery_mAh          = self.battery_capacity_mAh
+        self.battery_pct          = 100.0
+
+    def reset(self, pos: np.ndarray, att: np.ndarray = None) -> None:
+        self.pos   = pos.copy()
+        self.vel   = np.zeros(3)
+        self.att   = att.copy() if att is not None else np.zeros(3)
+        self.omega = np.zeros(3)
+        self.battery_mAh = self.battery_capacity_mAh
+        self.battery_pct = 100.0
+
+    def step(self, motor_cmds: np.ndarray, wind: np.ndarray, dt: float) -> None:
+        """Integrate dynamics one timestep."""
+        motor_cmds = np.clip(motor_cmds, 0.0, 1.0)
+
+        # ── Rotor forces ──────────────────────────────────────────────
+        T = np.sum(motor_cmds) * self.k_T  # Total thrust (body Z)
+
+        l = self.arm
+        # Torques: [roll, pitch, yaw] from differential thrust
+        tau_roll  = self.k_T * l * (motor_cmds[0] - motor_cmds[1] - motor_cmds[2] + motor_cmds[3])
+        tau_pitch = self.k_T * l * (motor_cmds[0] + motor_cmds[1] - motor_cmds[2] - motor_cmds[3])
+        tau_yaw   = self.k_M * (-motor_cmds[0] + motor_cmds[1] - motor_cmds[2] + motor_cmds[3])
+        tau       = np.array([tau_roll, tau_pitch, tau_yaw])
+
+        roll, pitch, yaw = self.att
+        R = euler_to_rotation_matrix(roll, pitch, yaw)
+
+        # ── Linear acceleration (world frame) ─────────────────────────
+        # Thrust in world frame
+        thrust_world = R @ np.array([0, 0, T])
+
+        # Aerodynamic drag (oppose velocity)
+        drag = -self.drag_c * self.vel * np.abs(self.vel)
+
+        # Wind force
+        wind_force = 0.05 * wind  # Simple wind force model
+
+        gravity = np.array([0, 0, -self.mass * self.G])
+
+        # Ground effect (reduces at z < 2*rotor_diameter)
+        ge_factor = 1.0
+        if self.pos[2] < 0.5:
+            ge_factor = 1.0 + 0.3 * max(0, (0.5 - self.pos[2]))
+
+        f_total = thrust_world * ge_factor + drag + wind_force + gravity
+        accel   = f_total / self.mass
+
+        # ── Angular acceleration (body frame) ─────────────────────────
+        gyro_term = np.cross(self.omega, self.I @ self.omega)
+        alpha     = self.I_inv @ (tau - gyro_term)
+
+        # ── Euler integration ─────────────────────────────────────────
+        self.vel  += accel  * dt
+        self.pos  += self.vel * dt
+
+        # Limit velocity
+        speed = np.linalg.norm(self.vel)
+        if speed > self.max_vel:
+            self.vel = self.vel / speed * self.max_vel
+
+        # Euler angles
+        self.omega += alpha * dt
+        # Omega to Euler rate
+        sr, cr = math.sin(roll), math.cos(roll)
+        sp, cp = math.sin(pitch), math.cos(pitch)
+        tp = math.tan(pitch)
+        T_mat = np.array([
+            [1, sr*tp,  cr*tp],
+            [0, cr,    -sr   ],
+            [0, sr/cp,  cr/cp],
+        ]) if abs(cp) > 1e-6 else np.eye(3)
+        att_dot   = T_mat @ self.omega
+        self.att  += att_dot * dt
+        self.att[2] = wrap_angle(self.att[2])
+
+        # Clamp angles (not more than 60° tilt)
+        self.att[0] = clamp(self.att[0], -math.pi/3, math.pi/3)
+        self.att[1] = clamp(self.att[1], -math.pi/3, math.pi/3)
+
+        # Ground collision
+        if self.pos[2] < 0.0:
+            self.pos[2] = 0.0
+            self.vel[2] = max(0, self.vel[2])
+
+        # ── Battery consumption ───────────────────────────────────────
+        current = self.hover_current_A * np.mean(motor_cmds) * 1.5
+        self.battery_mAh -= current * (dt / 3600.0) * 1000.0  # mAh consumed
+        self.battery_pct = max(0.0, 100.0 * self.battery_mAh / self.battery_capacity_mAh)
+
+    @property
+    def accel_body(self) -> np.ndarray:
+        """IMU-observed specific force in body frame."""
+        R = euler_to_rotation_matrix(*self.att)
+        a_world = np.zeros(3)   # We'd need prev_vel for true accel
+        return R.T @ (a_world + np.array([0, 0, self.G]))
+
+    @property
+    def state_vector(self) -> np.ndarray:
+        return np.concatenate([self.pos, self.vel, self.att, self.omega])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Wind Model
+# ──────────────────────────────────────────────────────────────────────────────
+
+class WindModel:
+    """
+    Dryden turbulence model + Gaussian gusts.
+    Altitude-dependent mean wind with spectral shaping.
+    """
+
+    def __init__(self, config: dict):
+        wind = config.get("environment", {}).get("wind", {})
+        self._base_speed  = wind.get("base_speed_ms", 3.0)
+        self._turbulence  = wind.get("turbulence_intensity", 0.4)
+        self._gust_prob   = wind.get("gust_probability", 0.05)
+        self._gust_max    = wind.get("gust_max_ms", 8.0)
+        self._enabled     = wind.get("enabled", True)
+
+        self._wind_vec    = np.array([self._base_speed, 0.0, 0.0])
+        self._gust_rem    = 0.0
+        self._gust_vec    = np.zeros(3)
+        self._t           = 0.0
+
+    def update(self, altitude: float, dt: float) -> np.ndarray:
+        if not self._enabled:
+            return np.zeros(3)
+
+        self._t += dt
+
+        # Altitude gradient (wind speed increases with altitude)
+        alt_factor = 1.0 + 0.02 * max(0, altitude - 10.0)
+
+        # Base wind (slowly rotating)
+        angle = self._t * 0.005
+        self._wind_vec = self._base_speed * alt_factor * np.array([
+            math.cos(angle), math.sin(angle), 0.0
+        ])
+
+        # Dryden turbulence
+        turb = np.random.normal(0, self._turbulence * self._base_speed, 3)
+        turb[2] *= 0.3   # Less vertical turbulence
+
+        # Gust
+        if self._gust_rem > 0:
+            self._gust_rem -= dt
+        elif random.random() < self._gust_prob * dt:
+            gust_dir = normalize_vector(np.random.randn(3))
+            gust_dir[2] *= 0.2
+            speed = random.uniform(self._gust_max * 0.5, self._gust_max)
+            self._gust_vec  = gust_dir * speed
+            self._gust_rem  = random.uniform(0.5, 3.0)
+            log.debug(f"Wind gust: {speed:.1f} m/s for {self._gust_rem:.1f}s")
+        else:
+            # Gust decay
+            self._gust_vec *= 0.95
+
+        return self._wind_vec + turb + self._gust_vec
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Obstacle Generator
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ObstacleGenerator:
+    """Generates static and dynamic obstacles for the environment."""
+
+    TYPES = {
+        "urban":      {"buildings": 30, "vehicles": 5,  "trees": 15},
+        "forest":     {"buildings": 2,  "vehicles": 0,  "trees": 50},
+        "mountain":   {"buildings": 5,  "vehicles": 2,  "trees": 20},
+        "open_field": {"buildings": 3,  "vehicles": 3,  "trees": 8 },
+    }
+
+    def __init__(self, config: dict):
+        env = config.get("environment", {})
+        self._env_type   = env.get("type", "urban")
+        self._grid       = env.get("grid_size", [200, 200, 100])
+        obs_cfg          = env.get("obstacles", {})
+        self._n_static   = obs_cfg.get("static_count", 50)
+        self._n_dynamic  = obs_cfg.get("dynamic_count", 5)
+        self._dyn_speed  = obs_cfg.get("dynamic_speed_ms", 2.0)
+
+        self._static:  List[dict] = []
+        self._dynamic: List[dict] = []
+
+    def generate(self, forbidden_zones: List[Tuple] = None) -> Tuple[List, List]:
+        """Generate static + dynamic obstacles; returns (static, dynamic)."""
+        self._static.clear()
+        self._dynamic.clear()
+        forbidden_zones = forbidden_zones or []
+
+        # Static obstacles
+        type_counts = self.TYPES.get(self._env_type, self.TYPES["urban"])
+        for obs_type, count in type_counts.items():
+            for _ in range(count):
+                pos = self._random_position(forbidden_zones)
+                if pos is None:
+                    continue
+
+                if obs_type == "buildings":
+                    h  = random.uniform(10, 50)
+                    r  = random.uniform(5, 20)
+                    self._static.append({
+                        "type": "building",
+                        "position": pos + np.array([0, 0, h/2]),
+                        "radius": r, "height": h,
+                        "color": "#4a4a4a",
+                    })
+                elif obs_type == "trees":
+                    h = random.uniform(5, 20)
+                    self._static.append({
+                        "type": "tree",
+                        "position": pos + np.array([0, 0, h/2]),
+                        "radius": random.uniform(1, 4), "height": h,
+                        "color": "#2d6a2d",
+                    })
+                else:
+                    self._static.append({
+                        "type": "vehicle",
+                        "position": pos,
+                        "radius": random.uniform(1.5, 3.0), "height": 2.0,
+                        "color": "#888888",
+                    })
+
+        # Dynamic obstacles (birds, drones, vehicles)
+        for i in range(self._n_dynamic):
+            pos = self._random_position(forbidden_zones, z_range=(5, 40))
+            if pos is None:
+                continue
+            vel = normalize_vector(np.random.randn(3)) * self._dyn_speed
+            vel[2] *= 0.1
+            self._dynamic.append({
+                "id": i,
+                "type": "dynamic",
+                "position": pos.copy(),
+                "velocity": vel,
+                "radius": random.uniform(0.5, 2.0),
+                "color": "#ff4444",
+            })
+
+        log.info(f"Obstacles: {len(self._static)} static, {len(self._dynamic)} dynamic")
+        return self._static, self._dynamic
+
+    def update_dynamic(self, dt: float) -> None:
+        for obs in self._dynamic:
+            obs["position"] = np.array(obs["position"]) + np.array(obs["velocity"]) * dt
+            # Bounce off grid bounds
+            for i, bound in enumerate([self._grid[0], self._grid[1], 60]):
+                if obs["position"][i] < 0 or obs["position"][i] > bound:
+                    obs["velocity"][i] *= -1
+
+    def _random_position(self, forbidden: List, z_range=(0, 0)) -> Optional[np.ndarray]:
+        for _ in range(50):
+            x = random.uniform(5, self._grid[0] - 5)
+            y = random.uniform(5, self._grid[1] - 5)
+            z = random.uniform(*z_range) if z_range[1] > 0 else 0.0
+            pos = np.array([x, y, z])
+            # Check forbidden zones (around start/goal)
+            valid = all(np.linalg.norm(pos - np.array(fz[:3])) > fz[3]
+                        for fz in forbidden)
+            if valid:
+                return pos
+        return None
+
+    @property
+    def all_obstacles(self) -> List[dict]:
+        return self._static + self._dynamic
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gymnasium UAV Environment
+# ──────────────────────────────────────────────────────────────────────────────
+
+class UAVNavigationEnv(gym.Env):
+    """
+    Full autonomous UAV navigation gymnasium environment.
+
+    Observation space (48-dim):
+      [0:3]   ENU position (normalized)
+      [3:6]   ENU velocity (normalized)
+      [6:9]   Euler attitude [rad]
+      [9:12]  Angular rates [rad/s]
+      [12:15] Goal direction unit vector
+      [15]    Distance to goal (normalized)
+      [16]    Battery percentage
+      [17]    GNSS quality
+      [18:24] LiDAR sector distances (6 sectors, normalized)
+      [24:27] Wind estimate
+      [27:30] Previous action
+      [30:48] 18 nearest obstacle relative positions
+
+    Action space (4-dim, continuous [-1, 1]):
+      [0:3]   Velocity command (x, y, z) normalized
+      [3]     Yaw rate command
+    """
+
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
+
+    OBS_DIM = 48
+    ACT_DIM = 4
+
+    def __init__(self, config: dict, record: bool = False):
+        super().__init__()
+        self._cfg     = config
+        self._record  = record
+
+        # Spaces
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf,
+            shape=(self.OBS_DIM,), dtype=np.float32
+        )
+        self.action_space = spaces.Box(
+            low=-1.0, high=1.0,
+            shape=(self.ACT_DIM,), dtype=np.float32
+        )
+
+        # Sub-systems
+        self._dynamics  = UAVDynamics(config)
+        self._wind      = WindModel(config)
+        self._obs_gen   = ObstacleGenerator(config)
+        self._sensors   = SensorSuite(config)
+        self._fusion    = SensorFusionManager(config.get("fusion", {}).get("algorithm", "EKF"))
+        self._controller= CascadedController(config)
+        self._mission   = MissionPlanner(config)
+
+        # Grid size
+        env_cfg = config.get("environment", {})
+        self._grid = np.array(env_cfg.get("grid_size", [200, 200, 100]), dtype=float)
+        self._dt   = env_cfg.get("time_step_s", 0.02)
+        self._max_vel = config.get("uav", {}).get("max_velocity_ms", 15.0)
+
+        # Reward weights
+        rew = config.get("rl", {}).get("rewards", {})
+        self._r_wp          = rew.get("waypoint_reach", 100.0)
+        self._r_collision   = rew.get("collision_penalty", -200.0)
+        self._r_step        = rew.get("step_penalty", -0.1)
+        self._r_energy      = rew.get("energy_efficiency", 0.5)
+        self._r_smooth      = rew.get("smoothness_reward", 0.3)
+
+        # Episode state
+        self._goal_pos:  np.ndarray = np.zeros(3)
+        self._static_obs: List = []
+        self._dynamic_obs:List = []
+        self._step_count  = 0
+        self._max_steps   = 2000
+        self._prev_action = np.zeros(self.ACT_DIM)
+        self._prev_dist   = 0.0
+        self._recorder    = None
+        self._t           = 0.0
+
+    # ── Gymnasium API ─────────────────────────────────────────────────────────
+
+    def reset(self, seed=None, options=None):
+        try:
+            super().reset(seed=seed)
+        except Exception:
+            pass
+        if seed is not None:
+            np.random.seed(seed)
+            random.seed(seed)
+
+        # Random start & goal
+        start = np.array([
+            random.uniform(10, 30),
+            random.uniform(10, 30),
+            random.uniform(5, 15),
+        ])
+        self._goal_pos = np.array([
+            random.uniform(self._grid[0]-30, self._grid[0]-10),
+            random.uniform(self._grid[1]-30, self._grid[1]-10),
+            random.uniform(5, 20),
+        ])
+
+        # Reset subsystems
+        self._dynamics.reset(start)
+        self._wind = WindModel(self._cfg)
+        self._controller.reset()
+
+        # Generate obstacles (keep start/goal clear)
+        forbidden = [
+            (*start, 15.0),
+            (*self._goal_pos, 10.0),
+        ]
+        self._static_obs, self._dynamic_obs = self._obs_gen.generate(forbidden)
+        self._mission.update_obstacles(self._static_obs)
+
+        # Init fusion
+        self._fusion.initialize(start, np.zeros(3), np.zeros(3))
+
+        self._step_count  = 0
+        self._prev_action = np.zeros(self.ACT_DIM)
+        self._prev_dist   = float(np.linalg.norm(start - self._goal_pos))
+        self._t           = 0.0
+
+        if self._record:
+            self._recorder = FlightDataRecorder()
+
+        obs = self._get_observation()
+        return obs.astype(np.float32), {}
+
+    def step(self, action: np.ndarray):
+        action = np.clip(action, -1.0, 1.0)
+
+        vel_cmd = action[:3] * self._max_vel * 0.7
+        yaw_cmd = float(action[3]) * math.radians(90)
+
+        # Current state
+        pos   = self._dynamics.pos.copy()
+        vel   = self._dynamics.vel.copy()
+        att   = self._dynamics.att.copy()
+        omega = self._dynamics.omega.copy()
+
+        # Target: goal or next path waypoint
+        target = self._get_target_position(pos)
+
+        # PID controller for velocity → motor commands
+        ctrl = self._controller.update(
+            pos=pos, vel=vel, att=att, omega=omega,
+            pos_sp=target,
+            vel_sp=vel_cmd,
+            yaw_sp=yaw_cmd,
+            dt=self._dt,
+        )
+
+        # Wind
+        wind_vec = self._wind.update(pos[2], self._dt)
+
+        # Dynamics step
+        self._dynamics.step(ctrl.motor_commands, wind_vec, self._dt)
+
+        # Update dynamic obstacles
+        self._obs_gen.update_dynamic(self._dt)
+
+        # Sensor update
+        imu_dt = self._dt
+        imu_meas = IMUMeasurement(
+            accel=self._dynamics.accel_body,
+            gyro=self._dynamics.omega.copy(),
+            dt=imu_dt,
+        )
+        sensor_data = self._sensors.update(
+            pos=self._dynamics.pos, vel=self._dynamics.vel, att=self._dynamics.att,
+            accel_body=self._dynamics.accel_body, omega_body=self._dynamics.omega,
+            obstacles=self._obs_gen.all_obstacles, dt=self._dt,
+        )
+
+        # Fusion update
+        fused = self._fusion.step(
+            imu=sensor_data["imu"],
+            gnss=sensor_data["gnss"],
+            baro=sensor_data["baro"],
+            mag=sensor_data["mag"],
+        )
+
+        self._prev_action = action.copy()
+        self._step_count += 1
+        self._t          += self._dt
+
+        # Rewards and termination
+        reward, terminated, truncated, info = self._compute_reward_and_done(action)
+
+        if self._record and self._recorder:
+            self._recorder.record(
+                t=self._t, pos=self._dynamics.pos, vel=self._dynamics.vel,
+                att=self._dynamics.att, battery_pct=self._dynamics.battery_pct,
+                gnss_quality=fused.gnss_quality, n_obstacles=len(self._obs_gen.all_obstacles),
+                action=action, reward=reward, mode="RL",
+            )
+
+        obs  = self._get_observation()
+        return obs.astype(np.float32), float(reward), terminated, truncated, info
+
+    def render(self):
+        pass   # Rendering handled by dashboard
+
+    def close(self):
+        if self._recorder:
+            paths = self._recorder.save()
+            log.info(f"Flight data saved: {paths}")
+
+    # ── Observation Builder ───────────────────────────────────────────────────
+
+    def _get_observation(self) -> np.ndarray:
+        pos   = self._dynamics.pos
+        vel   = self._dynamics.vel
+        att   = self._dynamics.att
+        omega = self._dynamics.omega
+
+        # Goal info
+        to_goal = self._goal_pos - pos
+        dist    = np.linalg.norm(to_goal)
+        dir_goal= to_goal / max(dist, 1e-6)
+
+        # LiDAR sectors (6 sectors of 60° each)
+        lidar_scan = self._sensors.lidar.update(pos, self._obs_gen.all_obstacles, att[2])
+        sector_size = len(lidar_scan.ranges) // 6
+        sectors = np.array([
+            np.min(lidar_scan.ranges[i*sector_size:(i+1)*sector_size])
+            for i in range(6)
+        ]) / self._sensors.lidar._range_max
+
+        # Nearest obstacles
+        all_obs = self._obs_gen.all_obstacles
+        obs_feats = np.zeros(18)
+        if all_obs:
+            dists   = [np.linalg.norm(np.array(o["position"]) - pos) for o in all_obs]
+            nearest = sorted(range(len(all_obs)), key=lambda i: dists[i])[:6]
+            for j, idx in enumerate(nearest):
+                rel = np.array(all_obs[idx]["position"]) - pos
+                obs_feats[j*3:(j+1)*3] = np.clip(rel / 50.0, -1, 1)
+
+        obs = np.concatenate([
+            pos / self._grid,                    # [0:3]  normalized position
+            np.clip(vel / self._max_vel, -1, 1), # [3:6]  normalized velocity
+            att,                                  # [6:9]  attitude
+            np.clip(omega / 5.0, -1, 1),         # [9:12] angular rates
+            dir_goal,                             # [12:15] goal direction
+            [dist / np.linalg.norm(self._grid)], # [15]   normalized dist
+            [self._dynamics.battery_pct / 100.0],# [16]   battery
+            [self._fusion.state.gnss_quality],   # [17]   GNSS quality
+            sectors,                              # [18:24] lidar sectors
+            np.zeros(3),                          # [24:27] wind estimate (placeholder)
+            self._prev_action,                    # [27:31] prev action
+            obs_feats,                            # [30:48] nearest obstacles
+        ])
+        return obs[:self.OBS_DIM]
+
+    def _get_target_position(self, pos: np.ndarray) -> np.ndarray:
+        """Returns the immediate navigation target (next path waypoint or goal)."""
+        target = self._mission.get_next_target(pos)
+        if target is None:
+            return self._goal_pos.copy()
+        return target
+
+    # ── Reward Computation ────────────────────────────────────────────────────
+
+    def _compute_reward_and_done(
+        self, action: np.ndarray
+    ) -> Tuple[float, bool, bool, dict]:
+        pos   = self._dynamics.pos
+        vel   = self._dynamics.vel
+        batt  = self._dynamics.battery_pct
+        dist  = float(np.linalg.norm(pos - self._goal_pos))
+
+        terminated = False
+        truncated  = False
+        reward     = 0.0
+
+        # 1. Progress reward (dense)
+        reward += (self._prev_dist - dist) * 2.0
+        self._prev_dist = dist
+
+        # 2. Goal reached
+        if dist < 3.0:
+            reward += self._r_wp
+            terminated = True
+            log.info(f"Goal reached! steps={self._step_count}")
+
+        # 3. Collision check
+        collision = self._check_collision(pos)
+        if collision:
+            reward += self._r_collision
+            terminated = True
+            log.warning(f"Collision! pos={np.round(pos,1)}")
+
+        # 4. Boundary violation
+        if (pos[0] < -5 or pos[0] > self._grid[0]+5 or
+            pos[1] < -5 or pos[1] > self._grid[1]+5 or
+            pos[2] < 0.5 or pos[2] > self._grid[2]):
+            reward -= 50.0
+            terminated = True
+
+        # 5. Step penalty
+        reward += self._r_step
+
+        # 6. Energy efficiency
+        speed = np.linalg.norm(vel)
+        reward += self._r_energy * (speed / self._max_vel) * 0.1
+
+        # 7. Action smoothness (penalize jerk)
+        jerk = np.linalg.norm(action - self._prev_action)
+        reward -= self._r_smooth * jerk * 0.1
+
+        # 8. Low battery warning
+        if batt < 10.0:
+            reward -= 5.0
+
+        # 9. Time limit
+        if self._step_count >= self._max_steps:
+            truncated = True
+
+        info = {
+            "distance_to_goal": dist,
+            "battery_pct": batt,
+            "collision": collision,
+            "step": self._step_count,
+        }
+        return reward, terminated, truncated, info
+
+    def _check_collision(self, pos: np.ndarray) -> bool:
+        for obs in self._obs_gen.all_obstacles:
+            obs_pos = np.array(obs["position"])
+            dist    = np.linalg.norm(pos - obs_pos)
+            if dist < obs.get("radius", 1.0) + 0.5:
+                return True
+        return False
+
+    # ── Properties for dashboard ──────────────────────────────────────────────
+
+    @property
+    def telemetry(self) -> dict:
+        pos  = self._dynamics.pos
+        vel  = self._dynamics.vel
+        att  = self._dynamics.att
+        dist = float(np.linalg.norm(pos - self._goal_pos))
+        return {
+            "position":   pos.tolist(),
+            "velocity":   vel.tolist(),
+            "attitude":   att.tolist(),
+            "speed_ms":   float(np.linalg.norm(vel)),
+            "altitude_m": float(pos[2]),
+            "battery_pct":float(self._dynamics.battery_pct),
+            "distance_to_goal": dist,
+            "step":       self._step_count,
+            "t":          self._t,
+            "goal":       self._goal_pos.tolist(),
+            "gnss_quality": float(self._fusion.state.gnss_quality),
+            "n_static_obs": len(self._static_obs),
+            "n_dynamic_obs":len(self._dynamic_obs),
+        }
